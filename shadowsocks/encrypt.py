@@ -34,8 +34,10 @@ method_supported.update(table.ciphers)
 
 
 def random_string(length):
-    return os.urandom(length)
-
+    try:
+        return os.urandom(length)
+    except NotImplementedError as e:
+        return openssl.rand_bytes(length)
 
 cached_keys = {}
 
@@ -71,19 +73,23 @@ def EVP_BytesToKey(password, key_len, iv_len):
 
 
 class Encryptor(object):
-    def __init__(self, key, method):
+    def __init__(self, key, method, iv = None):
         self.key = key
         self.method = method
         self.iv = None
         self.iv_sent = False
         self.cipher_iv = b''
         self.iv_buf = b''
+        self.cipher_key = b''
         self.decipher = None
         method = method.lower()
         self._method_info = self.get_method_info(method)
         if self._method_info:
-            self.cipher = self.get_cipher(key, method, 1,
+            if iv is None or len(iv) != self._method_info[1]:
+                self.cipher = self.get_cipher(key, method, 1,
                                           random_string(self._method_info[1]))
+            else:
+                self.cipher = self.get_cipher(key, method, 1, iv)
         else:
             logging.error('method %s not supported' % method)
             sys.exit(1)
@@ -109,6 +115,7 @@ class Encryptor(object):
         if op == 1:
             # this iv is for cipher not decipher
             self.cipher_iv = iv[:m[1]]
+        self.cipher_key = key
         return m[2](method, key, iv, op)
 
     def encrypt(self, buf):
@@ -153,6 +160,40 @@ def encrypt_all(password, method, op, data):
     else:
         iv = data[:iv_len]
         data = data[iv_len:]
+    cipher = m(method, key, iv, op)
+    result.append(cipher.update(data))
+    return b''.join(result)
+
+def encrypt_key(password, method):
+    method = method.lower()
+    (key_len, iv_len, m) = method_supported[method]
+    if key_len > 0:
+        key, _ = EVP_BytesToKey(password, key_len, iv_len)
+    else:
+        key = password
+    return key
+
+def encrypt_iv_len(method):
+    method = method.lower()
+    (key_len, iv_len, m) = method_supported[method]
+    return iv_len
+
+def encrypt_new_iv(method):
+    method = method.lower()
+    (key_len, iv_len, m) = method_supported[method]
+    return random_string(iv_len)
+
+def encrypt_all_iv(key, method, op, data, ref_iv):
+    result = []
+    method = method.lower()
+    (key_len, iv_len, m) = method_supported[method]
+    if op:
+        iv = ref_iv[0]
+        result.append(iv)
+    else:
+        iv = data[:iv_len]
+        data = data[iv_len:]
+        ref_iv[0] = iv
     cipher = m(method, key, iv, op)
     result.append(cipher.update(data))
     return b''.join(result)

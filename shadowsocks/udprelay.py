@@ -70,12 +70,10 @@ import errno
 import random
 import binascii
 import traceback
+import threading
 
-from shadowsocks import encrypt, eventloop, lru_cache, common, shell
+from shadowsocks import encrypt, obfs, eventloop, lru_cache, common, shell
 from shadowsocks.common import pre_parse_header, parse_header, pack_addr
-
-# we clear at most TIMEOUTS_CLEAN_SIZE timeouts each time
-TIMEOUTS_CLEAN_SIZE = 512
 
 # for each handler, we have 2 stream directions:
 #    upstream:    from client to server direction
@@ -125,746 +123,15 @@ RSP_STATE_ERROR = b"\x03"
 RSP_STATE_DISCONNECT = b"\x04"
 RSP_STATE_REDIRECT = b"\x05"
 
-class UDPLocalAddress(object):
-    def __init__(self, addr):
-        self.addr = addr
-        self.last_activity = time.time()
-
-    def is_timeout(self):
-        return time.time() - self.last_activity > 30
-
-class PacketInfo(object):
-    def __init__(self, data):
-        self.data = data
-        self.time = time.time()
-
-class SendingQueue(object):
-    def __init__(self):
-        self.queue = {}
-        self.begin_id = 0
-        self.end_id = 1
-        self.interval = 0.5
-
-    def append(self, data):
-        self.queue[self.end_id] = PacketInfo(data)
-        self.end_id += 1
-        return self.end_id - 1
-
-    def empty(self):
-        return self.begin_id + 1 == self.end_id
-
-    def size(self):
-        return self.end_id - self.begin_id - 1
-
-    def get_begin_id(self):
-        return self.begin_id
-
-    def get_end_id(self):
-        return self.end_id
-
-    def get_data_list(self, pack_id_base, pack_id_list):
-        ret_list = []
-        curtime = time.time()
-        for pack_id in pack_id_list:
-            offset = pack_id_base + pack_id
-            if offset <= self.begin_id or self.end_id <= offset:
-                continue
-            ret_data = self.queue[offset]
-            if curtime - ret_data.time > self.interval:
-                ret_data.time = curtime
-                ret_list.append( (offset, ret_data.data) )
-        return ret_list
-
-    def set_finish(self, begin_id, done_list):
-        while self.begin_id < begin_id:
-            self.begin_id += 1
-            del self.queue[self.begin_id]
-
-class RecvQueue(object):
-    def __init__(self):
-        self.queue = {}
-        self.miss_queue = set()
-        self.begin_id = 0
-        self.end_id = 1
-
-    def empty(self):
-        return self.begin_id + 1 == self.end_id
-
-    def insert(self, pack_id, data):
-        if (pack_id not in self.queue) and pack_id > self.begin_id:
-            self.queue[pack_id] = PacketInfo(data)
-            if self.end_id == pack_id:
-                self.end_id = pack_id + 1
-            elif self.end_id < pack_id:
-                eid = self.end_id
-                while eid < pack_id:
-                    self.miss_queue.add(eid)
-                    eid += 1
-                self.end_id = pack_id + 1
-            else:
-                self.miss_queue.remove(pack_id)
-
-    def set_end(self, end_id):
-        if end_id > self.end_id:
-            eid = self.end_id
-            while eid < end_id:
-                self.miss_queue.add(eid)
-                eid += 1
-            self.end_id = end_id
-
-    def get_begin_id(self):
-        return self.begin_id
-
-    def has_data(self):
-        return (self.begin_id + 1) in self.queue
-
-    def get_data(self):
-        if (self.begin_id + 1) in self.queue:
-            self.begin_id += 1
-            pack_id = self.begin_id
-            ret_data = self.queue[pack_id]
-            del self.queue[pack_id]
-            return (pack_id, ret_data.data)
-
-    def get_missing_id(self, begin_id):
-        missing = []
-        if begin_id == 0:
-            begin_id = self.begin_id
-        for i in self.miss_queue:
-            if i - begin_id > 32768:
-                break
-            missing.append(i - begin_id)
-        return (begin_id, missing)
-
-class AddressMap(object):
-    def __init__(self):
-        self._queue = []
-        self._addr_map = {}
-
-    def add(self, addr):
-        if addr in self._addr_map:
-            self._addr_map[addr] = UDPLocalAddress(addr)
-        else:
-            self._addr_map[addr] = UDPLocalAddress(addr)
-            self._queue.append(addr)
-
-    def keys(self):
-        return self._queue
-
-    def get(self):
-        if self._queue:
-            while True:
-                if len(self._queue) == 1:
-                    return self._queue[0]
-                index = random.randint(0, len(self._queue) - 1)
-                addr = self._queue[index]
-                if self._addr_map[addr].is_timeout():
-                    self._queue[index] = self._queue[len(self._queue) - 1]
-                    del self._queue[len(self._queue) - 1]
-                    del self._addr_map[addr]
-                else:
-                    break
-            return addr
-        else:
-            return None
-
-class TCPRelayHandler(object):
-    def __init__(self, server, reqid_to_handlers, fd_to_handlers, loop,
-                local_sock, local_id, client_param, config,
-                dns_resolver, is_local):
-        self._server = server
-        self._reqid_to_handlers = reqid_to_handlers
-        self._fd_to_handlers = fd_to_handlers
-        self._loop = loop
-        self._local_sock = local_sock
-        self._remote_sock = None
-        self._remote_udp = False
-        self._config = config
-        self._dns_resolver = dns_resolver
-        self._local_id = local_id
-
-        self._is_local = is_local
-        self._stage = STAGE_INIT
-        self._password = config['password']
-        self._method = config['method']
-        self._fastopen_connected = False
-        self._data_to_write_to_local = []
-        self._data_to_write_to_remote = []
-        self._upstream_status = WAIT_STATUS_READING
-        self._downstream_status = WAIT_STATUS_INIT
-        self._request_id = 0
-        self._client_address = AddressMap()
-        self._remote_address = None
-        self._sendingqueue = SendingQueue()
-        self._recvqueue = RecvQueue()
-        if 'forbidden_ip' in config:
-            self._forbidden_iplist = config['forbidden_ip']
-        else:
-            self._forbidden_iplist = None
-        #fd_to_handlers[local_sock.fileno()] = self
-        #local_sock.setblocking(False)
-        #loop.add(local_sock, eventloop.POLL_IN | eventloop.POLL_ERR)
-        self.last_activity = 0
-        self._update_activity()
-        self._random_mtu_size = [random.randint(POST_MTU_MIN, POST_MTU_MAX) for i in range(1024)]
-        self._random_mtu_index = 0
-
-        self._rand_data = b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10" * 4
-
-    def __hash__(self):
-        # default __hash__ is id / 16
-        # we want to eliminate collisions
-        return id(self)
-
-    @property
-    def remote_address(self):
-        return self._remote_address
-
-    def add_local_address(self, addr):
-        self._client_address.add(addr)
-
-    def get_local_address(self):
-        return self._client_address.get()
-
-    def _update_activity(self):
-        # tell the TCP Relay we have activities recently
-        # else it will think we are inactive and timed out
-        self._server.update_activity(self)
-
-    def _update_stream(self, stream, status):
-        # update a stream to a new waiting status
-
-        # check if status is changed
-        # only update if dirty
-        dirty = False
-        if stream == STREAM_DOWN:
-            if self._downstream_status != status:
-                self._downstream_status = status
-                dirty = True
-        elif stream == STREAM_UP:
-            if self._upstream_status != status:
-                self._upstream_status = status
-                dirty = True
-        if dirty:
-            '''
-            if self._local_sock:
-                event = eventloop.POLL_ERR
-                if self._downstream_status & WAIT_STATUS_WRITING:
-                    event |= eventloop.POLL_OUT
-                if self._upstream_status & WAIT_STATUS_READING:
-                    event |= eventloop.POLL_IN
-                self._loop.modify(self._local_sock, event)
-            '''
-            if self._remote_sock:
-                event = eventloop.POLL_ERR
-                if self._downstream_status & WAIT_STATUS_READING:
-                    event |= eventloop.POLL_IN
-                if self._upstream_status & WAIT_STATUS_WRITING:
-                    event |= eventloop.POLL_OUT
-                self._loop.modify(self._remote_sock, event)
-
-    def _write_to_sock(self, data, sock, addr = None):
-        # write data to sock
-        # if only some of the data are written, put remaining in the buffer
-        # and update the stream to wait for writing
-        if not data or not sock:
-            return False
-
-        uncomplete = False
-        retry = 0
-        if sock == self._local_sock:
-            data = encrypt.encrypt_all(self._password, self._method, 1, data)
-            if addr is None:
-                return False
-            try:
-                self._server.write_to_server_socket(data, addr)
-            except (OSError, IOError) as e:
-                error_no = eventloop.errno_from_exception(e)
-                uncomplete = True
-                if error_no in (errno.EAGAIN, errno.EINPROGRESS,
-                                errno.EWOULDBLOCK):
-                    pass
-                else:
-                    #traceback.print_exc()
-                    shell.print_exception(e)
-                    self.destroy()
-                    return False
-        else:
-            try:
-                l = len(data)
-                s = sock.send(data)
-                if s < l:
-                    data = data[s:]
-                    uncomplete = True
-            except (OSError, IOError) as e:
-                error_no = eventloop.errno_from_exception(e)
-                if error_no in (errno.EAGAIN, errno.EINPROGRESS,
-                                errno.EWOULDBLOCK):
-                    uncomplete = True
-                else:
-                    #logging.error(traceback.extract_stack())
-                    #traceback.print_exc()
-                    shell.print_exception(e)
-                    self.destroy()
-                    return False
-        if uncomplete:
-            if sock == self._local_sock:
-                self._update_stream(STREAM_DOWN, WAIT_STATUS_WRITING)
-            elif sock == self._remote_sock:
-                self._data_to_write_to_remote.append(data)
-                self._update_stream(STREAM_UP, WAIT_STATUS_WRITING)
-            else:
-                logging.error('write_all_to_sock:unknown socket')
-        else:
-            if sock == self._local_sock:
-                if self._sendingqueue.size() > SENDING_WINDOW_SIZE:
-                    self._update_stream(STREAM_DOWN, WAIT_STATUS_WRITING)
-                else:
-                    self._update_stream(STREAM_DOWN, WAIT_STATUS_READING)
-            elif sock == self._remote_sock:
-                self._update_stream(STREAM_UP, WAIT_STATUS_READING)
-            else:
-                logging.error('write_all_to_sock:unknown socket')
-        return True
-
-    def _create_remote_socket(self, ip, port):
-        addrs = socket.getaddrinfo(ip, port, 0, socket.SOCK_STREAM, socket.SOL_TCP)
-        if len(addrs) == 0:
-            raise Exception("getaddrinfo failed for %s:%d" % (ip, port))
-        af, socktype, proto, canonname, sa = addrs[0]
-        if self._forbidden_iplist:
-            if common.to_str(sa[0]) in self._forbidden_iplist:
-                raise Exception('IP %s is in forbidden list, reject' %
-                                common.to_str(sa[0]))
-        remote_sock = socket.socket(af, socktype, proto)
-        self._remote_sock = remote_sock
-
-        self._fd_to_handlers[remote_sock.fileno()] = self
-
-        remote_sock.setblocking(False)
-        remote_sock.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
-        return remote_sock
-
-    def _handle_dns_resolved(self, result, error):
-        if error:
-            self._log_error(error)
-            self.destroy()
-            return
-        if result:
-            ip = result[1]
-            if ip:
-
-                try:
-                    self._stage = STAGE_CONNECTING
-                    remote_addr = ip
-                    remote_port = self._remote_address[1]
-                    logging.info("connect to %s : %d" % (remote_addr, remote_port))
-
-                    remote_sock = self._create_remote_socket(remote_addr,
-                                                             remote_port)
-                    try:
-                        remote_sock.connect((remote_addr, remote_port))
-                    except (OSError, IOError) as e:
-                        if eventloop.errno_from_exception(e) in (errno.EINPROGRESS,
-                                errno.EWOULDBLOCK):
-                            pass # always goto here
-                        else:
-                            raise e
-
-                    self._loop.add(remote_sock,
-                                   eventloop.POLL_ERR | eventloop.POLL_OUT,
-                                   self._server)
-                    self._update_stream(STREAM_UP, WAIT_STATUS_READWRITING)
-                    self._update_stream(STREAM_DOWN, WAIT_STATUS_READING)
-                    self._stage = STAGE_STREAM
-
-                    addr = self.get_local_address()
-
-                    for i in range(2):
-                        rsp_data = self._pack_rsp_data(CMD_RSP_CONNECT_REMOTE, RSP_STATE_CONNECTEDREMOTE)
-                        self._write_to_sock(rsp_data, self._local_sock, addr)
-
-                    return
-                except Exception as e:
-                    shell.print_exception(e)
-                    if self._config['verbose']:
-                        traceback.print_exc()
-        self.destroy()
-
-    def _on_local_read(self):
-        # handle all local read events and dispatch them to methods for
-        # each stage
-        self._update_activity()
-        if not self._local_sock:
-            return
-        data = None
-        try:
-            data = self._local_sock.recv(BUF_SIZE)
-        except (OSError, IOError) as e:
-            if eventloop.errno_from_exception(e) in \
-                    (errno.ETIMEDOUT, errno.EAGAIN, errno.EWOULDBLOCK):
-                return
-        if not data:
-            self.destroy()
-            return
-        if not data:
-            return
-        self._server.server_transfer_ul += len(data)
-        #TODO ============================================================
-        if self._stage == STAGE_STREAM:
-            self._write_to_sock(data, self._remote_sock)
-            return
-
-    def _on_remote_read(self):
-        # handle all remote read events
-        self._update_activity()
-        data = None
-        try:
-            data = self._remote_sock.recv(BUF_SIZE)
-        except (OSError, IOError) as e:
-            if eventloop.errno_from_exception(e) in \
-                    (errno.ETIMEDOUT, errno.EAGAIN, errno.EWOULDBLOCK, 10035): #errno.WSAEWOULDBLOCK
-                return
-        if not data:
-            self.destroy()
-            return
-        self._server.server_transfer_dl += len(data)
-        try:
-            recv_data = data
-            beg_pos = 0
-            max_len = len(recv_data)
-            while beg_pos < max_len:
-                if beg_pos + POST_MTU_MAX >= max_len:
-                    split_pos = max_len
-                else:
-                    split_pos = beg_pos + self._random_mtu_size[self._random_mtu_index]
-                    self._random_mtu_index = (self._random_mtu_index + 1) & 0x3ff
-                    #split_pos = beg_pos + random.randint(POST_MTU_MIN, POST_MTU_MAX)
-                data = recv_data[beg_pos:split_pos]
-                beg_pos = split_pos
-
-                pack_id = self._sendingqueue.append(data)
-                post_data = self._pack_post_data(CMD_POST, pack_id, data)
-                addr = self.get_local_address()
-                self._write_to_sock(post_data, self._local_sock, addr)
-                if pack_id <= DOUBLE_SEND_BEG_IDS:
-                    post_data = self._pack_post_data(CMD_POST, pack_id, data)
-                    self._write_to_sock(post_data, self._local_sock, addr)
-
-        except Exception as e:
-            shell.print_exception(e)
-            if self._config['verbose']:
-                traceback.print_exc()
-            # TODO use logging when debug completed
-            self.destroy()
-
-    def _on_local_write(self):
-        # handle local writable event
-        if self._data_to_write_to_local:
-            data = b''.join(self._data_to_write_to_local)
-            self._data_to_write_to_local = []
-            self._write_to_sock(data, self._local_sock)
-        else:
-            self._update_stream(STREAM_DOWN, WAIT_STATUS_READING)
-
-    def _on_remote_write(self):
-        # handle remote writable event
-        self._stage = STAGE_STREAM
-        if self._data_to_write_to_remote:
-            data = b''.join(self._data_to_write_to_remote)
-            self._data_to_write_to_remote = []
-            self._write_to_sock(data, self._remote_sock)
-        else:
-            self._update_stream(STREAM_UP, WAIT_STATUS_READING)
-
-    def _on_local_error(self):
-        logging.debug('got local error')
-        if self._local_sock:
-            logging.error(eventloop.get_sock_error(self._local_sock))
-        self.destroy()
-
-    def _on_remote_error(self):
-        logging.debug('got remote error')
-        if self._remote_sock:
-            logging.error(eventloop.get_sock_error(self._remote_sock))
-        self.destroy()
-
-    def _pack_rsp_data(self, cmd, data):
-        reqid_str = struct.pack(">H", self._request_id)
-        return b''.join([CMD_VER_STR, common.chr(cmd), reqid_str, data, self._rand_data[:random.randint(0, len(self._rand_data))], reqid_str])
-
-    def _pack_rnd_data(self, data):
-        length = random.randint(0, len(self._rand_data))
-        if length == 0:
-            return data
-        elif length == 1:
-            return b"\x81" + data
-        elif length < 256:
-            return b"\x80" + common.chr(length) + self._rand_data[:length - 2] + data
-        else:
-            return b"\x82" + struct.pack(">H", length) + self._rand_data[:length - 3] + data
-
-    def _pack_post_data(self, cmd, pack_id, data):
-        reqid_str = struct.pack(">H", self._request_id)
-        recv_id = self._recvqueue.get_begin_id()
-        rsp_data = b''.join([CMD_VER_STR, common.chr(cmd), reqid_str, struct.pack(">I", recv_id), struct.pack(">I", pack_id), data, reqid_str])
-        return rsp_data
-
-    def _pack_post_data_64(self, cmd, send_id, pack_id, data):
-        reqid_str = struct.pack(">H", self._request_id)
-        recv_id = self._recvqueue.get_begin_id()
-        rsp_data = b''.join([CMD_VER_STR, common.chr(cmd), reqid_str, struct.pack(">Q", recv_id), struct.pack(">Q", pack_id), data, reqid_str])
-        return rsp_data
-
-    def sweep_timeout(self):
-        logging.info("sweep_timeout")
-        if self._stage == STAGE_STREAM:
-            pack_id, missing = self._recvqueue.get_missing_id(0)
-            logging.info("sweep_timeout %s %s" % (pack_id, missing))
-            data = b''
-            for pid in missing:
-                data += struct.pack(">H", pid)
-            rsp_data = self._pack_post_data(CMD_SYN_STATUS, pack_id, data)
-            addr = self.get_local_address()
-            self._write_to_sock(rsp_data, self._local_sock, addr)
-
-    def handle_stream_sync_status(self, addr, cmd, request_id, pack_id, max_send_id, data):
-        missing_list = []
-        while len(data) >= 2:
-            pid = struct.unpack(">H", data[0:2])[0]
-            data = data[2:]
-            missing_list.append(pid)
-        done_list = []
-        self._recvqueue.set_end(max_send_id)
-        self._sendingqueue.set_finish(pack_id, done_list)
-
-        if self._stage == STAGE_DESTROYED and self._sendingqueue.empty():
-            self.destroy_local()
-            return
-
-        # post CMD_SYN_STATUS
-        send_id = self._sendingqueue.get_end_id()
-        post_pack_id, missing = self._recvqueue.get_missing_id(0)
-        pack_ids_data = b''
-        for pid in missing:
-            pack_ids_data += struct.pack(">H", pid)
-
-        rsp_data = self._pack_rnd_data(self._pack_post_data(CMD_SYN_STATUS, send_id, pack_ids_data))
-        self._write_to_sock(rsp_data, self._local_sock, addr)
-
-        send_list = self._sendingqueue.get_data_list(pack_id, missing_list)
-        for post_pack_id, post_data in send_list:
-            rsp_data = self._pack_post_data(CMD_POST, post_pack_id, post_data)
-            self._write_to_sock(rsp_data, self._local_sock, addr)
-            if post_pack_id <= DOUBLE_SEND_BEG_IDS:
-                rsp_data = self._pack_post_data(CMD_POST, post_pack_id, post_data)
-                self._write_to_sock(rsp_data, self._local_sock, addr)
-
-    def handle_client(self, addr, cmd, request_id, data):
-        self.add_local_address(addr)
-        if cmd == CMD_DISCONNECT:
-            rsp_data = self._pack_rsp_data(CMD_DISCONNECT, RSP_STATE_EMPTY)
-            self._write_to_sock(rsp_data, self._local_sock, addr)
-            self.destroy()
-            self.destroy_local()
-            return
-        if self._stage == STAGE_INIT:
-            if cmd == CMD_CONNECT:
-                self._request_id = request_id
-                self._stage = STAGE_RSP_ID
-            return
-        if self._request_id != request_id:
-            return
-
-        if self._stage == STAGE_RSP_ID:
-            if cmd == CMD_CONNECT:
-                for i in range(2):
-                    rsp_data = self._pack_rsp_data(CMD_RSP_CONNECT, RSP_STATE_CONNECTED)
-                    self._write_to_sock(rsp_data, self._local_sock, addr)
-            elif cmd == CMD_CONNECT_REMOTE:
-                local_id = data[0:4]
-                if self._local_id == local_id:
-                    data = data[4:]
-                    header_result = parse_header(data)
-                    if header_result is None:
-                        return
-                    connecttype, remote_addr, remote_port, header_length = header_result
-                    self._remote_address = (common.to_str(remote_addr), remote_port)
-                    self._stage = STAGE_DNS
-                    self._dns_resolver.resolve(remote_addr,
-                                               self._handle_dns_resolved)
-                    logging.info('TCP connect %s:%d from %s:%d' % (remote_addr, remote_port, addr[0], addr[1]))
-                else:
-                    # ileagal request
-                    rsp_data = self._pack_rsp_data(CMD_DISCONNECT, RSP_STATE_EMPTY)
-                    self._write_to_sock(rsp_data, self._local_sock, addr)
-        elif self._stage == STAGE_CONNECTING:
-            if cmd == CMD_CONNECT_REMOTE:
-                local_id = data[0:4]
-                if self._local_id == local_id:
-                    for i in range(2):
-                        rsp_data = self._pack_rsp_data(CMD_RSP_CONNECT_REMOTE, RSP_STATE_CONNECTEDREMOTE)
-                        self._write_to_sock(rsp_data, self._local_sock, addr)
-                else:
-                    # ileagal request
-                    rsp_data = self._pack_rsp_data(CMD_DISCONNECT, RSP_STATE_EMPTY)
-                    self._write_to_sock(rsp_data, self._local_sock, addr)
-        elif self._stage == STAGE_STREAM:
-            if len(data) < 4:
-                # ileagal request
-                rsp_data = self._pack_rsp_data(CMD_DISCONNECT, RSP_STATE_EMPTY)
-                self._write_to_sock(rsp_data, self._local_sock, addr)
-                return
-            local_id = data[0:4]
-            if self._local_id != local_id:
-                # ileagal request
-                rsp_data = self._pack_rsp_data(CMD_DISCONNECT, RSP_STATE_EMPTY)
-                self._write_to_sock(rsp_data, self._local_sock, addr)
-                return
-            else:
-                data = data[4:]
-            if cmd == CMD_CONNECT_REMOTE:
-                rsp_data = self._pack_rsp_data(CMD_RSP_CONNECT_REMOTE, RSP_STATE_CONNECTEDREMOTE)
-                self._write_to_sock(rsp_data, self._local_sock, addr)
-            elif cmd == CMD_POST:
-                recv_id = struct.unpack(">I", data[0:4])[0]
-                pack_id = struct.unpack(">I", data[4:8])[0]
-                self._recvqueue.insert(pack_id, data[8:])
-                self._sendingqueue.set_finish(recv_id, [])
-            elif cmd == CMD_POST_64:
-                recv_id = struct.unpack(">Q", data[0:8])[0]
-                pack_id = struct.unpack(">Q", data[8:16])[0]
-                self._recvqueue.insert(pack_id, data[16:])
-                self._sendingqueue.set_finish(recv_id, [])
-            elif cmd == CMD_DISCONNECT:
-                rsp_data = self._pack_rsp_data(CMD_DISCONNECT, RSP_STATE_EMPTY)
-                self._write_to_sock(rsp_data, self._local_sock, addr)
-                self.destroy()
-                self.destroy_local()
-                return
-            elif cmd == CMD_SYN_STATUS:
-                pack_id = struct.unpack(">I", data[0:4])[0]
-                max_send_id = struct.unpack(">I", data[4:8])[0]
-                data = data[8:]
-                self.handle_stream_sync_status(addr, cmd, request_id, pack_id, max_send_id, data)
-            elif cmd == CMD_SYN_STATUS_64:
-                pack_id = struct.unpack(">Q", data[0:8])[0]
-                max_send_id = struct.unpack(">Q", data[8:16])[0]
-                data = data[16:]
-                self.handle_stream_sync_status(addr, cmd, request_id, pack_id, max_send_id, data)
-            while self._recvqueue.has_data():
-                pack_id, post_data = self._recvqueue.get_data()
-                self._write_to_sock(post_data, self._remote_sock)
-        elif self._stage == STAGE_DESTROYED:
-            local_id = data[0:4]
-            if self._local_id != local_id:
-                # ileagal request
-                rsp_data = self._pack_rsp_data(CMD_DISCONNECT, RSP_STATE_EMPTY)
-                self._write_to_sock(rsp_data, self._local_sock, addr)
-                return
-            else:
-                data = data[4:]
-            if cmd == CMD_SYN_STATUS:
-                pack_id = struct.unpack(">I", data[0:4])[0]
-                max_send_id = struct.unpack(">I", data[4:8])[0]
-                data = data[8:]
-                self.handle_stream_sync_status(addr, cmd, request_id, pack_id, max_send_id, data)
-            elif cmd == CMD_SYN_STATUS_64:
-                pack_id = struct.unpack(">Q", data[0:8])[0]
-                max_send_id = struct.unpack(">Q", data[8:16])[0]
-                data = data[16:]
-                self.handle_stream_sync_status(addr, cmd, request_id, pack_id, max_send_id, data)
-
-    def handle_event(self, sock, event):
-        # handle all events in this handler and dispatch them to methods
-        if self._stage == STAGE_DESTROYED:
-            logging.debug('ignore handle_event: destroyed')
-            return
-        # order is important
-        if sock == self._remote_sock:
-            if event & eventloop.POLL_ERR:
-                self._on_remote_error()
-                if self._stage == STAGE_DESTROYED:
-                    return
-            if event & (eventloop.POLL_IN | eventloop.POLL_HUP):
-                self._on_remote_read()
-                if self._stage == STAGE_DESTROYED:
-                    return
-            if event & eventloop.POLL_OUT:
-                self._on_remote_write()
-        elif sock == self._local_sock:
-            if event & eventloop.POLL_ERR:
-                self._on_local_error()
-                if self._stage == STAGE_DESTROYED:
-                    return
-            if event & (eventloop.POLL_IN | eventloop.POLL_HUP):
-                self._on_local_read()
-                if self._stage == STAGE_DESTROYED:
-                    return
-            if event & eventloop.POLL_OUT:
-                self._on_local_write()
-        else:
-            logging.warn('unknown socket')
-
-    def _log_error(self, e):
-        logging.error('%s when handling connection from %s' %
-                      (e, self._client_address.keys()))
-
-    def destroy(self):
-        # destroy the handler and release any resources
-        # promises:
-        # 1. destroy won't make another destroy() call inside
-        # 2. destroy releases resources so it prevents future call to destroy
-        # 3. destroy won't raise any exceptions
-        # if any of the promises are broken, it indicates a bug has been
-        # introduced! mostly likely memory leaks, etc
-        #logging.info('tcp destroy called')
-        if self._stage == STAGE_DESTROYED:
-            # this couldn't happen
-            logging.debug('already destroyed')
-            return
-        self._stage = STAGE_DESTROYED
-        if self._remote_address:
-            logging.debug('destroy: %s:%d' %
-                          self._remote_address)
-        else:
-            logging.debug('destroy')
-        if self._remote_sock:
-            logging.debug('destroying remote')
-            self._loop.remove(self._remote_sock)
-            try:
-                del self._fd_to_handlers[self._remote_sock.fileno()]
-            except Exception as e:
-                pass
-            self._remote_sock.close()
-            self._remote_sock = None
-        if self._sendingqueue.empty():
-            self.destroy_local()
-        self._dns_resolver.remove_callback(self._handle_dns_resolved)
-
-    def destroy_local(self):
-        if self._local_sock:
-            logging.debug('disconnect local')
-            rsp_data = self._pack_rsp_data(CMD_DISCONNECT, RSP_STATE_EMPTY)
-            addr = None
-            addr = self.get_local_address()
-            self._write_to_sock(rsp_data, self._local_sock, addr)
-            self._local_sock = None
-            try:
-                del self._reqid_to_handlers[self._request_id]
-            except Exception as e:
-                pass
-
-        self._server.remove_handler(self)
-
 def client_key(source_addr, server_af):
     # notice this is server af, not dest af
     return '%s:%s:%d' % (source_addr[0], source_addr[1], server_af)
 
-
 class UDPRelay(object):
-    def __init__(self, config, dns_resolver, is_local, stat_callback=None):
+    def __init__(self, config, dns_resolver, is_local, stat_callback=None, stat_counter=None):
         self._config = config
+        if config.get('connect_verbose_info', 0) > 0:
+            common.connect_log = logging.info
         if is_local:
             self._listen_addr = config['local_address']
             self._listen_port = config['local_port']
@@ -880,30 +147,62 @@ class UDPRelay(object):
         self._method = config['method']
         self._timeout = config['timeout']
         self._is_local = is_local
-        self._cache = lru_cache.LRUCache(timeout=config['timeout'],
-                                         close_callback=self._close_client)
-        self._client_fd_to_server_addr = \
-            lru_cache.LRUCache(timeout=config['timeout'])
-        self._dns_cache = lru_cache.LRUCache(timeout=300)
+        self._udp_cache_size = config['udp_cache']
+        self._cache = lru_cache.LRUCache(timeout=config['udp_timeout'],
+                                         close_callback=self._close_client_pair)
+        self._cache_dns_client = lru_cache.LRUCache(timeout=10,
+                                         close_callback=self._close_client_pair)
+        self._client_fd_to_server_addr = {}
+        #self._dns_cache = lru_cache.LRUCache(timeout=1800)
         self._eventloop = None
         self._closed = False
         self.server_transfer_ul = 0
         self.server_transfer_dl = 0
+        self.server_users = {}
+        self.server_user_transfer_ul = {}
+        self.server_user_transfer_dl = {}
+
+        if common.to_bytes(config['protocol']) in obfs.mu_protocol():
+            self._update_users(None, None)
+
+        self.protocol_data = obfs.obfs(config['protocol']).init_data()
+        self._protocol = obfs.obfs(config['protocol'])
+        server_info = obfs.server_info(self.protocol_data)
+        server_info.host = self._listen_addr
+        server_info.port = self._listen_port
+        server_info.users = self.server_users
+        server_info.protocol_param = config['protocol_param']
+        server_info.obfs_param = ''
+        server_info.iv = b''
+        server_info.recv_iv = b''
+        server_info.key_str = common.to_bytes(config['password'])
+        server_info.key = encrypt.encrypt_key(self._password, self._method)
+        server_info.head_len = 30
+        server_info.tcp_mss = 1452
+        server_info.buffer_size = BUF_SIZE
+        server_info.overhead = 0
+        self._protocol.set_server_info(server_info)
 
         self._sockets = set()
         self._fd_to_handlers = {}
         self._reqid_to_hd = {}
         self._data_to_write_to_server_socket = []
 
-        self._timeouts = []  # a list for all the handlers
-        # we trim the timeouts once a while
-        self._timeout_offset = 0   # last checked position for timeout
-        self._handler_to_timeouts = {}  # key: handler value: index in timeouts
+        self._timeout_cache = lru_cache.LRUCache(timeout=self._timeout,
+                                         close_callback=self._close_tcp_client)
+
+        self._bind = config.get('out_bind', '')
+        self._bindv6 = config.get('out_bindv6', '')
+        self._ignore_bind_list = config.get('ignore_bind', [])
 
         if 'forbidden_ip' in config:
             self._forbidden_iplist = config['forbidden_ip']
         else:
             self._forbidden_iplist = None
+        if 'forbidden_port' in config:
+            self._forbidden_portset = config['forbidden_port']
+        else:
+            self._forbidden_portset = None
 
         addrs = socket.getaddrinfo(self._listen_addr, self._listen_port, 0,
                                    socket.SOCK_DGRAM, socket.SOL_UDP)
@@ -914,8 +213,6 @@ class UDPRelay(object):
         server_socket = socket.socket(af, socktype, proto)
         server_socket.bind((self._listen_addr, self._listen_port))
         server_socket.setblocking(False)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 32)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024 * 32)
         self._server_socket = server_socket
         self._stat_callback = stat_callback
 
@@ -929,53 +226,113 @@ class UDPRelay(object):
         logging.debug('chosen server: %s:%d', server, server_port)
         return server, server_port
 
+    def get_ud(self):
+        return (self.server_transfer_ul, self.server_transfer_dl)
+
+    def get_users_ud(self):
+        ret = (self.server_user_transfer_ul.copy(), self.server_user_transfer_dl.copy())
+        return ret
+
+    def _update_users(self, protocol_param, acl):
+        if protocol_param is None:
+            protocol_param = self._config['protocol_param']
+        param = common.to_bytes(protocol_param).split(b'#')
+        if len(param) == 2:
+            user_list = param[1].split(b',')
+            if user_list:
+                for user in user_list:
+                    items = user.split(b':')
+                    if len(items) == 2:
+                        user_int_id = int(items[0])
+                        uid = struct.pack('<I', user_int_id)
+                        if acl is not None and user_int_id not in acl:
+                            self.del_user(uid)
+                        else:
+                            passwd = items[1]
+                            self.add_user(uid, {'password':passwd})
+
+    def _update_user(self, id, passwd):
+        uid = struct.pack('<I', id)
+        self.add_user(uid, passwd)
+
+    def update_users(self, users):
+        for uid in list(self.server_users.keys()):
+            id = struct.unpack('<I', uid)[0]
+            if id not in users:
+                self.del_user(uid)
+        for id in users:
+            uid = struct.pack('<I', id)
+            self.add_user(uid, users[id])
+
+    def add_user(self, uid, cfg): # user: binstr[4], passwd: str
+        passwd = cfg['password']
+        self.server_users[uid] = common.to_bytes(passwd)
+
+    def del_user(self, uid):
+        if uid in self.server_users:
+            del self.server_users[uid]
+
+    def add_transfer_u(self, user, transfer):
+        if user is None:
+            self.server_transfer_ul += transfer
+        else:
+            if user not in self.server_user_transfer_ul:
+                self.server_user_transfer_ul[user] = 0
+            self.server_user_transfer_ul[user] += transfer + self.server_transfer_ul
+            self.server_transfer_ul = 0
+
+    def add_transfer_d(self, user, transfer):
+        if user is None:
+            self.server_transfer_dl += transfer
+        else:
+            if user not in self.server_user_transfer_dl:
+                self.server_user_transfer_dl[user] = 0
+            self.server_user_transfer_dl[user] += transfer + self.server_transfer_dl
+            self.server_transfer_dl = 0
+
+    def _close_client_pair(self, client_pair):
+        client, uid = client_pair
+        self._close_client(client)
+
     def _close_client(self, client):
         if hasattr(client, 'close'):
+            if not self._is_local:
+                if client.fileno() in self._client_fd_to_server_addr:
+                    logging.debug('close_client: %s' %
+                                 (self._client_fd_to_server_addr[client.fileno()],))
+                else:
+                    client.info('close_client')
             self._sockets.remove(client.fileno())
             self._eventloop.remove(client)
+            del self._client_fd_to_server_addr[client.fileno()]
             client.close()
         else:
             # just an address
+            client.info('close_client pass %s' % client)
             pass
-
-    def _pre_parse_udp_header(self, data):
-        if data is None:
-            return
-        datatype = common.ord(data[0])
-        if datatype == 0x8:
-            if len(data) >= 8:
-                crc = binascii.crc32(data) & 0xffffffff
-                if crc != 0xffffffff:
-                    logging.warn('uncorrect CRC32, maybe wrong password or '
-                                 'encryption method')
-                    return None
-                cmd = common.ord(data[1])
-                request_id = struct.unpack('>H', data[2:4])[0]
-                data = data[4:-4]
-                return (cmd, request_id, data)
-            elif len(data) >= 6 and common.ord(data[1]) == 0x0:
-                crc = binascii.crc32(data) & 0xffffffff
-                if crc != 0xffffffff:
-                    logging.warn('uncorrect CRC32, maybe wrong password or '
-                                 'encryption method')
-                    return None
-                cmd = common.ord(data[1])
-                data = data[2:-4]
-                return (cmd, 0, data)
-            else:
-                logging.warn('header too short, maybe wrong password or '
-                             'encryption method')
-                return None
-        return data
-
-    def _pack_rsp_data(self, cmd, request_id, data):
-        _rand_data = b"123456789abcdefghijklmnopqrstuvwxyz" * 2
-        reqid_str = struct.pack(">H", request_id)
-        return b''.join([CMD_VER_STR, common.chr(cmd), reqid_str, data, _rand_data[:random.randint(0, len(_rand_data))], reqid_str])
 
     def _handel_protocol_error(self, client_address, ogn_data):
         #raise Exception('can not parse header')
         logging.warn("Protocol ERROR, UDP ogn data %s from %s:%d" % (binascii.hexlify(ogn_data), client_address[0], client_address[1]))
+
+    def _socket_bind_addr(self, sock, af):
+        bind_addr = ''
+        if self._bind and af == socket.AF_INET:
+            bind_addr = self._bind
+        elif self._bindv6 and af == socket.AF_INET6:
+            bind_addr = self._bindv6
+
+        bind_addr = bind_addr.replace("::ffff:", "")
+        if bind_addr in self._ignore_bind_list:
+            bind_addr = None
+        if bind_addr:
+            local_addrs = socket.getaddrinfo(bind_addr, 0, 0, socket.SOCK_DGRAM, socket.SOL_UDP)
+            if local_addrs[0][0] == af:
+                logging.debug("bind %s" % (bind_addr,))
+                try:
+                    sock.bind((bind_addr, 0))
+                except Exception as e:
+                    logging.warn("bind %s fail" % (bind_addr,))
 
     def _handle_server(self):
         server = self._server_socket
@@ -985,6 +342,7 @@ class UDPRelay(object):
             logging.debug('UDP handle_server: data is empty')
         if self._stat_callback:
             self._stat_callback(self._listen_port, len(data))
+        uid = None
         if self._is_local:
             frag = common.ord(data[2])
             if frag != 0:
@@ -993,83 +351,20 @@ class UDPRelay(object):
             else:
                 data = data[3:]
         else:
-            data = encrypt.encrypt_all(self._password, self._method, 0, data)
+            ref_iv = [0]
+            data = encrypt.encrypt_all_iv(self._protocol.obfs.server_info.key, self._method, 0, data, ref_iv)
             # decrypt data
             if not data:
                 logging.debug('UDP handle_server: data is empty after decrypt')
                 return
+            self._protocol.obfs.server_info.recv_iv = ref_iv[0]
+            data, uid = self._protocol.server_udp_post_decrypt(data)
 
         #logging.info("UDP data %s" % (binascii.hexlify(data),))
         if not self._is_local:
             data = pre_parse_header(data)
-
-            data = self._pre_parse_udp_header(data)
             if data is None:
                 return
-
-            if type(data) is tuple:
-                #(cmd, request_id, data)
-                #logging.info("UDP data %d %d %s" % (data[0], data[1], binascii.hexlify(data[2])))
-                try:
-                    if data[0] == 0:
-                        if len(data[2]) >= 4:
-                            for i in range(64):
-                                req_id = random.randint(1, 65535)
-                                if req_id not in self._reqid_to_hd:
-                                    break
-                            if req_id in self._reqid_to_hd:
-                                for i in range(64):
-                                    req_id = random.randint(1, 65535)
-                                    if type(self._reqid_to_hd[req_id]) is tuple:
-                                        break
-                            # return req id
-                            self._reqid_to_hd[req_id] = (data[2][0:4], None)
-                            rsp_data = self._pack_rsp_data(CMD_RSP_CONNECT, req_id, RSP_STATE_CONNECTED)
-                            data_to_send = encrypt.encrypt_all(self._password, self._method, 1, rsp_data)
-                            self.write_to_server_socket(data_to_send, r_addr)
-                    elif data[0] == CMD_CONNECT_REMOTE:
-                        if len(data[2]) > 4 and data[1] in self._reqid_to_hd:
-                            # create
-                            if type(self._reqid_to_hd[data[1]]) is tuple:
-                                if data[2][0:4] == self._reqid_to_hd[data[1]][0]:
-                                    handle = TCPRelayHandler(self, self._reqid_to_hd, self._fd_to_handlers,
-                                        self._eventloop, self._server_socket,
-                                        self._reqid_to_hd[data[1]][0], self._reqid_to_hd[data[1]][1],
-                                        self._config, self._dns_resolver, self._is_local)
-                                    self._reqid_to_hd[data[1]] = handle
-                                    handle.handle_client(r_addr, CMD_CONNECT, data[1], data[2])
-                                    handle.handle_client(r_addr, *data)
-                                    self.update_activity(handle)
-                                else:
-                                    # disconnect
-                                    rsp_data = self._pack_rsp_data(CMD_DISCONNECT, data[1], RSP_STATE_EMPTY)
-                                    data_to_send = encrypt.encrypt_all(self._password, self._method, 1, rsp_data)
-                                    self.write_to_server_socket(data_to_send, r_addr)
-                            else:
-                                self.update_activity(self._reqid_to_hd[data[1]])
-                                self._reqid_to_hd[data[1]].handle_client(r_addr, *data)
-                        else:
-                            # disconnect
-                            rsp_data = self._pack_rsp_data(CMD_DISCONNECT, data[1], RSP_STATE_EMPTY)
-                            data_to_send = encrypt.encrypt_all(self._password, self._method, 1, rsp_data)
-                            self.write_to_server_socket(data_to_send, r_addr)
-                    elif data[0] > CMD_CONNECT_REMOTE and data[0] <= CMD_DISCONNECT:
-                        if data[1] in self._reqid_to_hd:
-                            if type(self._reqid_to_hd[data[1]]) is tuple:
-                                pass
-                            else:
-                                self.update_activity(self._reqid_to_hd[data[1]])
-                                self._reqid_to_hd[data[1]].handle_client(r_addr, *data)
-                        else:
-                            # disconnect
-                            rsp_data = self._pack_rsp_data(CMD_DISCONNECT, data[1], RSP_STATE_EMPTY)
-                            data_to_send = encrypt.encrypt_all(self._password, self._method, 1, rsp_data)
-                            self.write_to_server_socket(data_to_send, r_addr)
-                    return
-                except Exception as e:
-                    trace = traceback.format_exc()
-                    logging.error(trace)
-                    return
 
         try:
             header_result = parse_header(data)
@@ -1080,61 +375,106 @@ class UDPRelay(object):
         if header_result is None:
             self._handel_protocol_error(r_addr, ogn_data)
             return
-        connecttype, dest_addr, dest_port, header_length = header_result
+        connecttype, addrtype, dest_addr, dest_port, header_length = header_result
 
         if self._is_local:
+            addrtype = 3
             server_addr, server_port = self._get_a_server()
         else:
             server_addr, server_port = dest_addr, dest_port
 
-        addrs = self._dns_cache.get(server_addr, None)
-        if addrs is None:
-            addrs = socket.getaddrinfo(server_addr, server_port, 0,
-                                       socket.SOCK_DGRAM, socket.SOL_UDP)
-            if not addrs:
-                # drop
-                return
+        if (addrtype & 7) == 3:
+            af = common.is_ip(server_addr)
+            if af == False:
+                handler = common.UDPAsyncDNSHandler((data, r_addr, uid, header_length))
+                handler.resolve(self._dns_resolver, (server_addr, server_port), self._handle_server_dns_resolved)
             else:
-                self._dns_cache[server_addr] = addrs
+                self._handle_server_dns_resolved("", (server_addr, server_port), server_addr, (data, r_addr, uid, header_length))
+        else:
+            self._handle_server_dns_resolved("", (server_addr, server_port), server_addr, (data, r_addr, uid, header_length))
 
-        af, socktype, proto, canonname, sa = addrs[0]
-        key = client_key(r_addr, af)
-        client = self._cache.get(key, None)
-        if not client:
-            # TODO async getaddrinfo
-            if self._forbidden_iplist:
-                if common.to_str(sa[0]) in self._forbidden_iplist:
-                    logging.debug('IP %s is in forbidden list, drop' %
-                                  common.to_str(sa[0]))
-                    # drop
+    def _handle_server_dns_resolved(self, error, remote_addr, server_addr, params):
+        if error:
+            return
+        data, r_addr, uid, header_length = params
+        user_id = self._listen_port
+        try:
+            server_port = remote_addr[1]
+            addrs = socket.getaddrinfo(server_addr, server_port, 0,
+                                        socket.SOCK_DGRAM, socket.SOL_UDP)
+            if not addrs: # drop
+                return
+            af, socktype, proto, canonname, sa = addrs[0]
+            server_addr = sa[0]
+            key = client_key(r_addr, af)
+            client_pair = self._cache.get(key, None)
+            if client_pair is None:
+                client_pair = self._cache_dns_client.get(key, None)
+            if client_pair is None:
+                if self._forbidden_iplist:
+                    if common.to_str(sa[0]) in self._forbidden_iplist:
+                        logging.debug('IP %s is in forbidden list, drop' % common.to_str(sa[0]))
+                        # drop
+                        return
+                if self._forbidden_portset:
+                    if sa[1] in self._forbidden_portset:
+                        logging.debug('Port %d is in forbidden list, reject' % sa[1])
+                        # drop
+                        return
+                client = socket.socket(af, socktype, proto)
+                client_uid = uid
+                client.setblocking(False)
+                self._socket_bind_addr(client, af)
+                is_dns = False
+                if len(data) > header_length + 13 and data[header_length + 4 : header_length + 12] == b"\x00\x01\x00\x00\x00\x00\x00\x00":
+                    is_dns = True
+                else:
+                    pass
+                if sa[1] == 53 and is_dns: #DNS
+                    logging.debug("DNS query %s from %s:%d" % (common.to_str(sa[0]), r_addr[0], r_addr[1]))
+                    self._cache_dns_client[key] = (client, uid)
+                else:
+                    self._cache[key] = (client, uid)
+                self._client_fd_to_server_addr[client.fileno()] = (r_addr, af)
+
+                self._sockets.add(client.fileno())
+                self._eventloop.add(client, eventloop.POLL_IN, self)
+
+                logging.debug('UDP port %5d sockets %d' % (self._listen_port, len(self._sockets)))
+
+                if uid is not None:
+                    user_id = struct.unpack('<I', client_uid)[0]
+            else:
+                client, client_uid = client_pair
+            self._cache.clear(self._udp_cache_size)
+            self._cache_dns_client.clear(16)
+
+            if self._is_local:
+                ref_iv = [encrypt.encrypt_new_iv(self._method)]
+                self._protocol.obfs.server_info.iv = ref_iv[0]
+                data = self._protocol.client_udp_pre_encrypt(data)
+                #logging.debug("%s" % (binascii.hexlify(data),))
+                data = encrypt.encrypt_all_iv(self._protocol.obfs.server_info.key, self._method, 1, data, ref_iv)
+                if not data:
                     return
-            client = socket.socket(af, socktype, proto)
-            client.setblocking(False)
-            self._cache[key] = client
-            self._client_fd_to_server_addr[client.fileno()] = r_addr
-
-            self._sockets.add(client.fileno())
-            self._eventloop.add(client, eventloop.POLL_IN, self)
-
-            logging.debug('UDP port %5d sockets %d' % (self._listen_port, len(self._sockets)))
-
-            logging.info('UDP data to %s:%d from %s:%d' %
-                        (common.to_str(server_addr), server_port,
-                            r_addr[0], r_addr[1]))
-
-        if self._is_local:
-            data = encrypt.encrypt_all(self._password, self._method, 1, data)
+            else:
+                data = data[header_length:]
             if not data:
                 return
-        else:
-            data = data[header_length:]
-        if not data:
-            return
+        except Exception as e:
+            shell.print_exception(e)
+            logging.error("exception from user %d" % (user_id,))
+
         try:
-            #logging.info('UDP handle_server sendto %s:%d %d bytes' % (common.to_str(server_addr), server_port, len(data)))
             client.sendto(data, (server_addr, server_port))
+            self.add_transfer_u(client_uid, len(data))
+            if client_pair is None: # new request
+                addr, port = client.getsockname()[:2]
+                common.connect_log('UDP data to %s(%s):%d from %s:%d by user %d' %
+                        (common.to_str(remote_addr[0]), common.to_str(server_addr), server_port, addr, port, user_id))
         except IOError as e:
             err = eventloop.errno_from_exception(e)
+            logging.warning('IOError sendto %s:%d by user %d' % (server_addr, server_port, user_id))
             if err in (errno.EINPROGRESS, errno.EAGAIN):
                 pass
             else:
@@ -1147,21 +487,39 @@ class UDPRelay(object):
             return
         if self._stat_callback:
             self._stat_callback(self._listen_port, len(data))
+
+        client_addr = self._client_fd_to_server_addr.get(sock.fileno())
+        client_uid = None
+        if client_addr:
+            key = client_key(client_addr[0], client_addr[1])
+            client_pair = self._cache.get(key, None)
+            client_dns_pair = self._cache_dns_client.get(key, None)
+            if client_pair:
+                client, client_uid = client_pair
+            elif client_dns_pair:
+                client, client_uid = client_dns_pair
+
         if not self._is_local:
             addrlen = len(r_addr[0])
             if addrlen > 255:
                 # drop
                 return
             data = pack_addr(r_addr[0]) + struct.pack('>H', r_addr[1]) + data
-            response = encrypt.encrypt_all(self._password, self._method, 1,
-                                           data)
+            ref_iv = [encrypt.encrypt_new_iv(self._method)]
+            self._protocol.obfs.server_info.iv = ref_iv[0]
+            data = self._protocol.server_udp_pre_encrypt(data, client_uid)
+            response = encrypt.encrypt_all_iv(self._protocol.obfs.server_info.key, self._method, 1,
+                                           data, ref_iv)
             if not response:
                 return
         else:
-            data = encrypt.encrypt_all(self._password, self._method, 0,
-                                       data)
+            ref_iv = [0]
+            data = encrypt.encrypt_all_iv(self._protocol.obfs.server_info.key, self._method, 0,
+                                       data, ref_iv)
             if not data:
                 return
+            self._protocol.obfs.server_info.recv_iv = ref_iv[0]
+            data = self._protocol.client_udp_post_decrypt(data)
             header_result = parse_header(data)
             if header_result is None:
                 return
@@ -1169,24 +527,26 @@ class UDPRelay(object):
             #logging.debug('UDP handle_client %s:%d to %s:%d' % (common.to_str(r_addr[0]), r_addr[1], dest_addr, dest_port))
 
             response = b'\x00\x00\x00' + data
-        client_addr = self._client_fd_to_server_addr.get(sock.fileno())
+
         if client_addr:
-            self.write_to_server_socket(response, client_addr)
+            if client_uid:
+                self.add_transfer_d(client_uid, len(response))
+            else:
+                self.server_transfer_dl += len(response)
+            self.write_to_server_socket(response, client_addr[0])
+            if client_dns_pair:
+                logging.debug("remove dns client %s:%d" % (client_addr[0][0], client_addr[0][1]))
+                del self._cache_dns_client[key]
+                self._close_client(client_dns_pair[0])
         else:
             # this packet is from somewhere else we know
             # simply drop that packet
             pass
 
     def write_to_server_socket(self, data, addr):
-        #self._server_socket.sendto(data, addr)
-        #'''
         uncomplete = False
         retry = 0
         try:
-            #"""
-            #if self._data_to_write_to_server_socket:
-            #    self._data_to_write_to_server_socket.append([(data, addr), 0])
-            #else:
             self._server_socket.sendto(data, addr)
             data = None
             while self._data_to_write_to_server_socket:
@@ -1195,7 +555,6 @@ class UDPRelay(object):
                 del self._data_to_write_to_server_socket[0]
                 data, addr = data_buf[0]
                 self._server_socket.sendto(data, addr)
-            #"""
         except (OSError, IOError) as e:
             error_no = eventloop.errno_from_exception(e)
             uncomplete = True
@@ -1220,62 +579,24 @@ class UDPRelay(object):
                             eventloop.POLL_IN | eventloop.POLL_ERR, self)
         loop.add_periodic(self.handle_periodic)
 
-    def remove_handler(self, handler):
-        index = self._handler_to_timeouts.get(hash(handler), -1)
-        if index >= 0:
-            # delete is O(n), so we just set it to None
-            self._timeouts[index] = None
-            del self._handler_to_timeouts[hash(handler)]
+    def remove_handler(self, client):
+        if hash(client) in self._timeout_cache:
+            del self._timeout_cache[hash(client)]
 
-    def update_activity(self, handler):
-        # set handler to active
-        now = int(time.time())
-        if now - handler.last_activity < eventloop.TIMEOUT_PRECISION:
-            # thus we can lower timeout modification frequency
-            return
-        handler.last_activity = now
-        index = self._handler_to_timeouts.get(hash(handler), -1)
-        if index >= 0:
-            # delete is O(n), so we just set it to None
-            self._timeouts[index] = None
-        length = len(self._timeouts)
-        self._timeouts.append(handler)
-        self._handler_to_timeouts[hash(handler)] = length
+    def update_activity(self, client):
+        self._timeout_cache[hash(client)] = client
 
     def _sweep_timeout(self):
-        # tornado's timeout memory management is more flexible than we need
-        # we just need a sorted last_activity queue and it's faster than heapq
-        # in fact we can do O(1) insertion/remove so we invent our own
-        if self._timeouts:
-            logging.log(shell.VERBOSE_LEVEL, 'sweeping timeouts')
-            now = time.time()
-            length = len(self._timeouts)
-            pos = self._timeout_offset
-            while pos < length:
-                handler = self._timeouts[pos]
-                if handler:
-                    if now - handler.last_activity < self._timeout:
-                        break
-                    else:
-                        if handler.remote_address:
-                            logging.warn('timed out: %s:%d' %
-                                         handler.remote_address)
-                        else:
-                            logging.warn('timed out')
-                        handler.destroy()
-                        handler.destroy_local()
-                        self._timeouts[pos] = None  # free memory
-                        pos += 1
-                else:
-                    pos += 1
-            if pos > TIMEOUTS_CLEAN_SIZE and pos > length >> 1:
-                # clean up the timeout queue when it gets larger than half
-                # of the queue
-                self._timeouts = self._timeouts[pos:]
-                for key in self._handler_to_timeouts:
-                    self._handler_to_timeouts[key] -= pos
-                pos = 0
-            self._timeout_offset = pos
+        self._timeout_cache.sweep()
+
+    def _close_tcp_client(self, client):
+        if client.remote_address:
+            logging.debug('timed out: %s:%d' %
+                         client.remote_address)
+        else:
+            logging.debug('timed out')
+        client.destroy()
+        client.destroy_local()
 
     def handle_event(self, sock, fd, event):
         if sock == self._server_socket:
@@ -1306,19 +627,22 @@ class UDPRelay(object):
 
     def handle_periodic(self):
         if self._closed:
+            self._cache.clear(0)
+            self._cache_dns_client.clear(0)
+            if self._eventloop:
+                self._eventloop.remove_periodic(self.handle_periodic)
+                self._eventloop.remove(self._server_socket)
             if self._server_socket:
                 self._server_socket.close()
                 self._server_socket = None
-                for sock in self._sockets:
-                    sock.close()
                 logging.info('closed UDP port %d', self._listen_port)
-        before_sweep_size = len(self._sockets)
-        self._cache.sweep()
-        self._dns_cache.sweep()
-        if before_sweep_size != len(self._sockets):
-            logging.debug('UDP port %5d sockets %d' % (self._listen_port, len(self._sockets)))
-        self._client_fd_to_server_addr.sweep()
-        self._sweep_timeout()
+        else:
+            before_sweep_size = len(self._sockets)
+            self._cache.sweep()
+            self._cache_dns_client.sweep()
+            if before_sweep_size != len(self._sockets):
+                logging.debug('UDP port %5d sockets %d' % (self._listen_port, len(self._sockets)))
+            self._sweep_timeout()
 
     def close(self, next_tick=False):
         logging.debug('UDP close')
@@ -1328,5 +652,5 @@ class UDPRelay(object):
                 self._eventloop.remove_periodic(self.handle_periodic)
                 self._eventloop.remove(self._server_socket)
             self._server_socket.close()
-            for client in list(self._cache.values()):
-                client.close()
+            self._cache.clear(0)
+            self._cache_dns_client.clear(0)

@@ -22,6 +22,8 @@ import sys
 import hashlib
 import logging
 
+from shadowsocks.common import ord
+
 def create_obfs(method):
     return plain(method)
 
@@ -37,6 +39,12 @@ class plain(object):
 
     def init_data(self):
         return b''
+
+    def get_overhead(self, direction): # direction: true for c->s false for s->c
+        return 0
+
+    def get_server_info(self):
+        return self.server_info
 
     def set_server_info(self, server_info):
         self.server_info = server_info
@@ -65,8 +73,32 @@ class plain(object):
         return (buf, True, False)
 
     def server_post_decrypt(self, buf):
+        return (buf, False)
+
+    def client_udp_pre_encrypt(self, buf):
         return buf
+
+    def client_udp_post_decrypt(self, buf):
+        return buf
+
+    def server_udp_pre_encrypt(self, buf, uid):
+        return buf
+
+    def server_udp_post_decrypt(self, buf):
+        return (buf, None)
 
     def dispose(self):
         pass
+
+    def get_head_size(self, buf, def_value):
+        if len(buf) < 2:
+            return def_value
+        head_type = ord(buf[0]) & 0x7
+        if head_type == 1:
+            return 7
+        if head_type == 4:
+            return 19
+        if head_type == 3:
+            return 4 + ord(buf[1])
+        return def_value
 

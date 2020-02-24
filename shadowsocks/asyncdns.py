@@ -28,7 +28,6 @@ if __name__ == '__main__':
     import sys
     import inspect
     file_path = os.path.dirname(os.path.realpath(inspect.getfile(inspect.currentframe())))
-    os.chdir(file_path)
     sys.path.insert(0, os.path.join(file_path, '../'))
 
 from shadowsocks import common, lru_cache, eventloop, shell
@@ -36,7 +35,7 @@ from shadowsocks import common, lru_cache, eventloop, shell
 
 CACHE_SWEEP_INTERVAL = 30
 
-VALID_HOSTNAME = re.compile(br"(?!-)[A-Z\d-]{1,63}(?<!-)$", re.IGNORECASE)
+VALID_HOSTNAME = re.compile(br"(?!-)[A-Z\d_-]{1,63}(?<!-)$", re.IGNORECASE)
 
 common.patch_socket()
 
@@ -80,9 +79,9 @@ QCLASS_IN = 1
 
 def detect_ipv6_supprot():
     if 'has_ipv6' in dir(socket):
-        s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
         try:
-            s.connect(('ipv6.google.com', 0))
+            s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            s.connect(('::1', 0))
             print('IPv6 support')
             return True
         except:
@@ -285,23 +284,44 @@ class DNSResolver(object):
     def _parse_resolv(self):
         self._servers = []
         try:
-            with open('/etc/resolv.conf', 'rb') as f:
+            with open('dns.conf', 'rb') as f:
                 content = f.readlines()
                 for line in content:
                     line = line.strip()
                     if line:
-                        if line.startswith(b'nameserver'):
-                            parts = line.split()
-                            if len(parts) >= 2:
-                                server = parts[1]
-                                if common.is_ip(server) == socket.AF_INET:
-                                    if type(server) != str:
-                                        server = server.decode('utf8')
-                                    self._servers.append(server)
+                        parts = line.split(b' ', 1)
+                        if len(parts) >= 2:
+                            server = parts[0]
+                            port = int(parts[1])
+                        else:
+                            server = parts[0]
+                            port = 53
+                        if common.is_ip(server) == socket.AF_INET:
+                            if type(server) != str:
+                                server = server.decode('utf8')
+                            self._servers.append((server, port))
         except IOError:
             pass
         if not self._servers:
-            self._servers = ['8.8.4.4', '8.8.8.8']
+            try:
+                with open('/etc/resolv.conf', 'rb') as f:
+                    content = f.readlines()
+                    for line in content:
+                        line = line.strip()
+                        if line:
+                            if line.startswith(b'nameserver'):
+                                parts = line.split()
+                                if len(parts) >= 2:
+                                    server = parts[1]
+                                    if common.is_ip(server) == socket.AF_INET:
+                                        if type(server) != str:
+                                            server = server.decode('utf8')
+                                        self._servers.append((server, 53))
+            except IOError:
+                pass
+        if not self._servers:
+            self._servers = [('8.8.4.4', 53), ('8.8.8.8', 53)]
+        logging.info('dns server: %s' % (self._servers,))
 
     def _parse_hosts(self):
         etc_path = '/etc/hosts'
@@ -311,6 +331,8 @@ class DNSResolver(object):
             with open(etc_path, 'rb') as f:
                 for line in f.readlines():
                     line = line.strip()
+                    if b"#" in line:
+                        line = line[:line.find(b'#')]
                     parts = line.split()
                     if len(parts) >= 2:
                         ip = parts[0]
@@ -342,7 +364,7 @@ class DNSResolver(object):
                 callback((hostname, ip), error)
             else:
                 callback((hostname, None),
-                         Exception('unknown hostname %s' % hostname))
+                         Exception('unable to parse hostname %s' % hostname))
         if hostname in self._hostname_to_cb:
             del self._hostname_to_cb[hostname]
         if hostname in self._hostname_status:
@@ -401,7 +423,7 @@ class DNSResolver(object):
             self._loop.add(self._sock, eventloop.POLL_IN, self)
         else:
             data, addr = sock.recvfrom(1024)
-            if addr[0] not in self._servers:
+            if addr not in self._servers:
                 logging.warn('received a packet other than our dns')
                 return
             self._handle_data(data)
@@ -426,7 +448,7 @@ class DNSResolver(object):
         for server in self._servers:
             logging.debug('resolving %s with type %d using server %s',
                           hostname, qtype, server)
-            self._sock.sendto(req, (server, 53))
+            self._sock.sendto(req, server)
 
     def resolve(self, hostname, callback):
         if type(hostname) != bytes:
@@ -447,6 +469,15 @@ class DNSResolver(object):
             if not is_valid_hostname(hostname):
                 callback(None, Exception('invalid hostname: %s' % hostname))
                 return
+            if False:
+                addrs = socket.getaddrinfo(hostname, 0, 0,
+                                       socket.SOCK_DGRAM, socket.SOL_UDP)
+                if addrs:
+                    af, socktype, proto, canonname, sa = addrs[0]
+                    logging.debug('DNS resolve %s %s' % (hostname, sa[0]) )
+                    self._cache[hostname] = sa[0]
+                    callback((hostname, sa[0]), None)
+                    return
             arr = self._hostname_to_cb.get(hostname, None)
             if not arr:
                 if IPV6_CONNECTION_SUPPORT:

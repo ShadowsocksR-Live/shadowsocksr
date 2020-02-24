@@ -1,3 +1,86 @@
+3.4.0 2017-07-27
+- add auth_chain_b
+- add initmudbjson.sh
+- allow set speed limit in runtime
+- fix bugs & mem leak
+
+3.3.3 2017-06-03
+- add DNS cache
+- add tls1.2_ticket_fastauth
+- fix bugs
+
+3.3.2 2017-05-20
+- revert http reply
+- refine tls1.2_ticket_auth error detector
+
+3.3.1 2017-05-18
+- fix stop script
+- Async DNS query under UDP
+- fix old version of OpenSSL
+- http reply
+
+3.3.0 2017-05-11
+- connect_log include local addr & port
+- fix auth_chain_a UDP bug
+- add "additional_ports_only"
+- add interface legendsockssr
+- run with newest python version
+- parse comment in hosts
+- update mujson_mgr
+- add cymysql setup script
+- new speed tester
+- fix leaks
+- bugs fixed
+
+3.2.0 2017-04-27
+- add auth_chain_a
+- remove auth_aes128, auth_sha1, auth_sha1_v2, verify_simple, auth_simple, verify_sha1
+
+3.1.2 2017-04-07
+- display UID
+- auto adjust TCP MSS
+
+3.1.1 2017-03-25
+- add "New session ticket"
+- ignore bind 10.0.0.0/8 and 192.168.0.0/16 by default
+- improve rand size under auth_aes128_*
+- fix bugs
+
+3.1.0 2017-03-16
+- add "glzjinmod" interface
+- rate limit
+- add additional_ports in config
+
+3.0.4 2017-01-08
+- multi-user in single port
+
+3.0.1 2017-01-03
+- remove auth_aes128_*_compatible
+
+3.0.0 2016-12-23
+- http_simple fix bugs
+- tls1.2_ticket_auth fix bug & defaule time diff set to 86400s
+
+2.9.7 2016-11-22
+- manage client with LRUCache
+- catch bind error
+- fix import error of resource on windows
+- print RLIMIT_NOFILE
+- always close cymysql objects
+- add init script
+
+2.9.6 2016-10-17
+- tls1.2_ticket_auth random packet size
+
+2.9.5.1 2016-10-16
+- UDP bind address
+
+2.9.5 2016-10-13
+- add auth_aes128_md5 and auth_aes128_sha1
+
+2.9.4 2016-10-11
+- sync client version
+
 2.6.13 2015-11-02
 - add protocol setting
 

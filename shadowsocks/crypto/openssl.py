@@ -49,8 +49,15 @@ def load_openssl():
     libcrypto.EVP_CipherUpdate.argtypes = (c_void_p, c_void_p, c_void_p,
                                            c_char_p, c_int)
 
-    libcrypto.EVP_CIPHER_CTX_cleanup.argtypes = (c_void_p,)
+    if hasattr(libcrypto, "EVP_CIPHER_CTX_cleanup"):
+        libcrypto.EVP_CIPHER_CTX_cleanup.argtypes = (c_void_p,)
+    else:
+        libcrypto.EVP_CIPHER_CTX_reset.argtypes = (c_void_p,)
     libcrypto.EVP_CIPHER_CTX_free.argtypes = (c_void_p,)
+
+    libcrypto.RAND_bytes.restype = c_int
+    libcrypto.RAND_bytes.argtypes = (c_void_p, c_int)
+
     if hasattr(libcrypto, 'OpenSSL_add_all_ciphers'):
         libcrypto.OpenSSL_add_all_ciphers()
 
@@ -60,22 +67,27 @@ def load_openssl():
 
 def load_cipher(cipher_name):
     func_name = 'EVP_' + cipher_name.replace('-', '_')
-    if bytes != str:
-        func_name = str(func_name, 'utf-8')
     cipher = getattr(libcrypto, func_name, None)
     if cipher:
         cipher.restype = c_void_p
         return cipher()
     return None
 
+def rand_bytes(length):
+    if not loaded:
+        load_openssl()
+    buf = create_string_buffer(length)
+    r = libcrypto.RAND_bytes(buf, length)
+    if r <= 0:
+        raise Exception('RAND_bytes return error')
+    return buf.raw
 
 class OpenSSLCrypto(object):
     def __init__(self, cipher_name, key, iv, op):
         self._ctx = None
         if not loaded:
             load_openssl()
-        cipher_name = common.to_bytes(cipher_name)
-        cipher = libcrypto.EVP_get_cipherbyname(cipher_name)
+        cipher = libcrypto.EVP_get_cipherbyname(common.to_bytes(cipher_name))
         if not cipher:
             cipher = load_cipher(cipher_name)
         if not cipher:
@@ -108,11 +120,17 @@ class OpenSSLCrypto(object):
 
     def clean(self):
         if self._ctx:
-            libcrypto.EVP_CIPHER_CTX_cleanup(self._ctx)
+            if hasattr(libcrypto, "EVP_CIPHER_CTX_cleanup"):
+                libcrypto.EVP_CIPHER_CTX_cleanup(self._ctx)
+            else:
+                libcrypto.EVP_CIPHER_CTX_reset(self._ctx)
             libcrypto.EVP_CIPHER_CTX_free(self._ctx)
 
 
 ciphers = {
+    'aes-128-cbc': (16, 16, OpenSSLCrypto),
+    'aes-192-cbc': (24, 16, OpenSSLCrypto),
+    'aes-256-cbc': (32, 16, OpenSSLCrypto),
     'aes-128-cfb': (16, 16, OpenSSLCrypto),
     'aes-192-cfb': (24, 16, OpenSSLCrypto),
     'aes-256-cfb': (32, 16, OpenSSLCrypto),

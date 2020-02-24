@@ -22,6 +22,9 @@ import socket
 import struct
 import logging
 import binascii
+import re
+
+from shadowsocks import lru_cache
 
 def compat_ord(s):
     if type(s) == int:
@@ -40,6 +43,7 @@ _chr = chr
 ord = compat_ord
 chr = compat_chr
 
+connect_log = logging.debug
 
 def to_bytes(s):
     if bytes != str:
@@ -84,7 +88,7 @@ def inet_pton(family, addr):
         if '.' in addr:  # a v4 addr
             v4addr = addr[addr.rindex(':') + 1:]
             v4addr = socket.inet_aton(v4addr)
-            v4addr = map(lambda x: ('%02X' % ord(x)), v4addr)
+            v4addr = ['%02X' % ord(x) for x in v4addr]
             v4addr.insert(2, ':')
             newaddr = addr[:addr.rindex(':') + 1] + ''.join(v4addr)
             return inet_pton(family, newaddr)
@@ -114,6 +118,13 @@ def is_ip(address):
             return family
         except (TypeError, ValueError, OSError, IOError):
             pass
+    return False
+
+
+def match_regex(regex, text):
+    regex = re.compile(regex)
+    for item in regex.findall(text):
+        return True
     return False
 
 
@@ -149,6 +160,8 @@ def pack_addr(address):
     return b'\x03' + chr(len(address)) + address
 
 def pre_parse_header(data):
+    if not data:
+        return None
     datatype = ord(data[0])
     if datatype == 0x80:
         if len(data) <= 2:
@@ -192,8 +205,8 @@ def parse_header(data):
     dest_addr = None
     dest_port = None
     header_length = 0
-    connecttype = (addrtype & 0x10) and 1 or 0
-    addrtype &= ~0x10
+    connecttype = (addrtype & 0x8) and 1 or 0
+    addrtype &= ~0x8
     if addrtype == ADDRTYPE_IPV4:
         if len(data) >= 7:
             dest_addr = socket.inet_ntoa(data[1:5])
@@ -204,7 +217,7 @@ def parse_header(data):
     elif addrtype == ADDRTYPE_HOST:
         if len(data) > 2:
             addrlen = ord(data[1])
-            if len(data) >= 2 + addrlen:
+            if len(data) >= 4 + addrlen:
                 dest_addr = data[2:2 + addrlen]
                 dest_port = struct.unpack('>H', data[2 + addrlen:4 +
                                                      addrlen])[0]
@@ -225,13 +238,14 @@ def parse_header(data):
                      'encryption method' % addrtype)
     if dest_addr is None:
         return None
-    return connecttype, to_bytes(dest_addr), dest_port, header_length
+    return connecttype, addrtype, to_bytes(dest_addr), dest_port, header_length
 
 
 class IPNetwork(object):
     ADDRLENGTH = {socket.AF_INET: 32, socket.AF_INET6: 128, False: 0}
 
     def __init__(self, addrs):
+        self.addrs_str = addrs
         self._network_list_v4 = []
         self._network_list_v6 = []
         if type(addrs) == str:
@@ -282,6 +296,79 @@ class IPNetwork(object):
         else:
             return False
 
+    def __cmp__(self, other):
+        return cmp(self.addrs_str, other.addrs_str)
+
+    def __eq__(self, other):
+        return self.addrs_str == other.addrs_str
+
+    def __ne__(self, other):
+        return self.addrs_str != other.addrs_str
+
+class PortRange(object):
+    def __init__(self, range_str):
+        self.range_str = to_str(range_str)
+        self.range = set()
+        range_str = to_str(range_str).split(',')
+        for item in range_str:
+            try:
+                int_range = item.split('-')
+                if len(int_range) == 1:
+                    if item:
+                        self.range.add(int(item))
+                elif len(int_range) == 2:
+                    int_range[0] = int(int_range[0])
+                    int_range[1] = int(int_range[1])
+                    if int_range[0] < 0:
+                        int_range[0] = 0
+                    if int_range[1] > 65535:
+                        int_range[1] = 65535
+                    i = int_range[0]
+                    while i <= int_range[1]:
+                        self.range.add(i)
+                        i += 1
+            except Exception as e:
+                logging.error(e)
+
+    def __contains__(self, val):
+        return val in self.range
+
+    def __cmp__(self, other):
+        return cmp(self.range_str, other.range_str)
+
+    def __eq__(self, other):
+        return self.range_str == other.range_str
+
+    def __ne__(self, other):
+        return self.range_str != other.range_str
+
+class UDPAsyncDNSHandler(object):
+    dns_cache = lru_cache.LRUCache(timeout=1800)
+    def __init__(self, params):
+        self.params = params
+        self.remote_addr = None
+        self.call_back = None
+
+    def resolve(self, dns_resolver, remote_addr, call_back):
+        if remote_addr in UDPAsyncDNSHandler.dns_cache:
+            if call_back:
+                call_back("", remote_addr, UDPAsyncDNSHandler.dns_cache[remote_addr], self.params)
+        else:
+            self.call_back = call_back
+            self.remote_addr = remote_addr
+            dns_resolver.resolve(remote_addr[0], self._handle_dns_resolved)
+            UDPAsyncDNSHandler.dns_cache.sweep()
+
+    def _handle_dns_resolved(self, result, error):
+        if error:
+            logging.error("%s when resolve DNS" % (error,)) #drop
+            return self.call_back(error, self.remote_addr, None, self.params)
+        if result:
+            ip = result[1]
+            if ip:
+                return self.call_back("", self.remote_addr, ip, self.params)
+        logging.warning("can't resolve %s" % (self.remote_addr,))
+        return self.call_back("fail to resolve", self.remote_addr, None, self.params)
 
 def test_inet_conv():
     ipv4 = b'8.8.4.4'
@@ -294,12 +381,12 @@ def test_inet_conv():
 
 def test_parse_header():
     assert parse_header(b'\x03\x0ewww.google.com\x00\x50') == \
-        (3, b'www.google.com', 80, 18)
+        (0, b'www.google.com', 80, 18)
     assert parse_header(b'\x01\x08\x08\x08\x08\x00\x35') == \
-        (1, b'8.8.8.8', 53, 7)
+        (0, b'8.8.8.8', 53, 7)
     assert parse_header((b'\x04$\x04h\x00@\x05\x08\x05\x00\x00\x00\x00\x00'
                          b'\x00\x10\x11\x00\x50')) == \
-        (4, b'2404:6800:4005:805::1011', 80, 19)
+        (0, b'2404:6800:4005:805::1011', 80, 19)
 
 
 def test_pack_header():

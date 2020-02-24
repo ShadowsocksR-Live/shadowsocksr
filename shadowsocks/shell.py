@@ -23,7 +23,7 @@ import json
 import sys
 import getopt
 import logging
-from shadowsocks.common import to_bytes, to_str, IPNetwork
+from shadowsocks.common import to_bytes, to_str, IPNetwork, PortRange
 from shadowsocks import encrypt
 
 
@@ -52,26 +52,37 @@ def print_exception(e):
         import traceback
         traceback.print_exc()
 
-
-def print_shadowsocks():
-    version = ''
+def __version():
+    version_str = ''
     try:
         import pkg_resources
-        version = pkg_resources.get_distribution('shadowsocks').version
+        version_str = pkg_resources.get_distribution('shadowsocks').version
     except Exception:
-        pass
-    print('Shadowsocks %s' % version)
+        try:
+            from shadowsocks import version
+            version_str = version.version()
+        except Exception:
+            pass
+    return version_str
+
+def print_shadowsocks():
+    print('ShadowsocksR %s' % __version())
+
+def log_shadowsocks_version():
+    logging.info('ShadowsocksR %s' % __version())
 
 
 def find_config():
+    user_config_path = 'user-config.json'
     config_path = 'config.json'
-    if os.path.exists(config_path):
-        return config_path
-    config_path = os.path.join(os.path.dirname(__file__), '../', 'config.json')
-    if os.path.exists(config_path):
-        return config_path
-    return None
 
+    def sub_find(file_name):
+        if os.path.exists(file_name):
+            return file_name
+        file_name = os.path.join(os.path.abspath('..'), file_name)
+        return file_name if os.path.exists(file_name) else None
+
+    return sub_find(user_config_path) or sub_find(config_path)
 
 def check_config(config, is_local):
     if config.get('daemon', None) == 'stop':
@@ -96,21 +107,15 @@ def check_config(config, is_local):
         config['server_port'] = int(config['server_port'])
 
     if config.get('local_address', '') in [b'0.0.0.0']:
-        logging.warn('warning: local set to listen on 0.0.0.0, it\'s not safe')
+        logging.warning('warning: local set to listen on 0.0.0.0, it\'s not safe')
     if config.get('server', '') in ['127.0.0.1', 'localhost']:
-        logging.warn('warning: server set to listen on %s:%s, are you sure?' %
+        logging.warning('warning: server set to listen on %s:%s, are you sure?' %
                      (to_str(config['server']), config['server_port']))
-    if (config.get('method', '') or '').lower() == 'table':
-        logging.warn('warning: table is not safe; please use a safer cipher, '
-                     'like AES-256-CFB')
-    if (config.get('method', '') or '').lower() == 'rc4':
-        logging.warn('warning: RC4 is not safe; please use a safer cipher, '
-                     'like AES-256-CFB')
     if config.get('timeout', 300) < 100:
-        logging.warn('warning: your timeout %d seems too short' %
+        logging.warning('warning: your timeout %d seems too short' %
                      int(config.get('timeout')))
     if config.get('timeout', 300) > 600:
-        logging.warn('warning: your timeout %d seems too long' %
+        logging.warning('warning: your timeout %d seems too long' %
                      int(config.get('timeout')))
     if config.get('password') in [b'mypassword']:
         logging.error('DON\'T USE DEFAULT PASSWORD! Please change it in your '
@@ -126,35 +131,45 @@ def check_config(config, is_local):
 
 def get_config(is_local):
     global verbose
-
+    config = {}
+    config_path = None
     logging.basicConfig(level=logging.INFO,
                         format='%(levelname)-s: %(message)s')
     if is_local:
-        shortopts = 'hd:s:b:p:k:l:m:o:c:t:vq'
+        shortopts = 'hd:s:b:p:k:l:m:O:o:G:g:c:t:vq'
         longopts = ['help', 'fast-open', 'pid-file=', 'log-file=', 'user=',
                     'version']
     else:
-        shortopts = 'hd:s:p:k:m:o:c:t:vq'
+        shortopts = 'hd:s:p:k:m:O:o:G:g:c:t:vq'
         longopts = ['help', 'fast-open', 'pid-file=', 'log-file=', 'workers=',
                     'forbidden-ip=', 'user=', 'manager-address=', 'version']
     try:
-        config_path = find_config()
         optlist, args = getopt.getopt(sys.argv[1:], shortopts, longopts)
         for key, value in optlist:
             if key == '-c':
                 config_path = value
+            elif key in ('-h', '--help'):
+                print_help(is_local)
+                sys.exit(0)
+            elif key == '--version':
+                print_shadowsocks()
+                sys.exit(0)
+            else:
+                continue
+
+        if config_path is None:
+            config_path = find_config()
+
 
         if config_path:
-            logging.info('loading config from %s' % config_path)
+            logging.debug('loading config from %s' % config_path)
             with open(config_path, 'rb') as f:
                 try:
-                    config = parse_json_in_str(f.read().decode('utf8'))
+                    config = parse_json_in_str(remove_comment(f.read().decode('utf8')))
                 except ValueError as e:
-                    logging.error('found an error in config.json: %s',
-                                  e.message)
+                    logging.error('found an error in config.json: %s', str(e))
                     sys.exit(1)
-        else:
-            config = {}
+
 
         v_count = 0
         for key, value in optlist:
@@ -168,8 +183,14 @@ def get_config(is_local):
                 config['server'] = to_str(value)
             elif key == '-m':
                 config['method'] = to_str(value)
+            elif key == '-O':
+                config['protocol'] = to_str(value)
             elif key == '-o':
                 config['obfs'] = to_str(value)
+            elif key == '-G':
+                config['protocol_param'] = to_str(value)
+            elif key == '-g':
+                config['obfs_param'] = to_str(value)
             elif key == '-b':
                 config['local_address'] = to_str(value)
             elif key == '-v':
@@ -187,16 +208,8 @@ def get_config(is_local):
             elif key == '--user':
                 config['user'] = to_str(value)
             elif key == '--forbidden-ip':
-                config['forbidden_ip'] = to_str(value).split(',')
-            elif key in ('-h', '--help'):
-                if is_local:
-                    print_local_help()
-                else:
-                    print_server_help()
-                sys.exit(0)
-            elif key == '--version':
-                print_shadowsocks()
-                sys.exit(0)
+                config['forbidden_ip'] = to_str(value)
+
             elif key == '-d':
                 config['daemon'] = to_str(value)
             elif key == '--pid-file':
@@ -206,6 +219,8 @@ def get_config(is_local):
             elif key == '-q':
                 v_count -= 1
                 config['verbose'] = v_count
+            else:
+                continue
     except getopt.GetoptError as e:
         print(e, file=sys.stderr)
         print_help(is_local)
@@ -219,15 +234,21 @@ def get_config(is_local):
     config['password'] = to_bytes(config.get('password', b''))
     config['method'] = to_str(config.get('method', 'aes-256-cfb'))
     config['protocol'] = to_str(config.get('protocol', 'origin'))
+    config['protocol_param'] = to_str(config.get('protocol_param', ''))
     config['obfs'] = to_str(config.get('obfs', 'plain'))
     config['obfs_param'] = to_str(config.get('obfs_param', ''))
     config['port_password'] = config.get('port_password', None)
+    config['additional_ports'] = config.get('additional_ports', {})
+    config['additional_ports_only'] = config.get('additional_ports_only', False)
     config['timeout'] = int(config.get('timeout', 300))
+    config['udp_timeout'] = int(config.get('udp_timeout', 120))
+    config['udp_cache'] = int(config.get('udp_cache', 64))
     config['fast_open'] = config.get('fast_open', False)
     config['workers'] = config.get('workers', 1)
-    config['pid-file'] = config.get('pid-file', '/var/run/shadowsocks.pid')
-    config['log-file'] = config.get('log-file', '/var/log/shadowsocks.log')
+    config['pid-file'] = config.get('pid-file', '/var/run/shadowsocksr.pid')
+    config['log-file'] = config.get('log-file', '/var/log/shadowsocksr.log')
     config['verbose'] = config.get('verbose', False)
+    config['connect_verbose_info'] = config.get('connect_verbose_info', 0)
     config['local_address'] = to_str(config.get('local_address', '127.0.0.1'))
     config['local_port'] = config.get('local_port', 1080)
     if is_local:
@@ -242,6 +263,17 @@ def get_config(is_local):
         try:
             config['forbidden_ip'] = \
                 IPNetwork(config.get('forbidden_ip', '127.0.0.0/8,::1/128'))
+        except Exception as e:
+            logging.error(e)
+            sys.exit(2)
+        try:
+            config['forbidden_port'] = PortRange(config.get('forbidden_port', ''))
+        except Exception as e:
+            logging.error(e)
+            sys.exit(2)
+        try:
+            config['ignore_bind'] = \
+                IPNetwork(config.get('ignore_bind', '127.0.0.0/8,::1/128,10.0.0.0/8,192.168.0.0/16'))
         except Exception as e:
             logging.error(e)
             sys.exit(2)
@@ -261,7 +293,7 @@ def get_config(is_local):
         level = logging.INFO
     verbose = config['verbose']
     logging.basicConfig(level=level,
-                        format='%(asctime)s %(levelname)-8s %(message)s',
+                        format='%(asctime)s %(levelname)-8s %(filename)s:%(lineno)s %(message)s',
                         datefmt='%Y-%m-%d %H:%M:%S')
 
     check_config(config, is_local)
@@ -365,6 +397,47 @@ def _decode_dict(data):
             value = _decode_dict(value)
         rv[key] = value
     return rv
+
+class JSFormat:
+    def __init__(self):
+        self.state = 0
+
+    def push(self, ch):
+        ch = ord(ch)
+        if self.state == 0:
+            if ch == ord('"'):
+                self.state = 1
+                return to_str(chr(ch))
+            elif ch == ord('/'):
+                self.state = 3
+            else:
+                return to_str(chr(ch))
+        elif self.state == 1:
+            if ch == ord('"'):
+                self.state = 0
+                return to_str(chr(ch))
+            elif ch == ord('\\'):
+                self.state = 2
+            return to_str(chr(ch))
+        elif self.state == 2:
+            self.state = 1
+            if ch == ord('"'):
+                return to_str(chr(ch))
+            return "\\" + to_str(chr(ch))
+        elif self.state == 3:
+            if ch == ord('/'):
+                self.state = 4
+            else:
+                return "/" + to_str(chr(ch))
+        elif self.state == 4:
+            if ch == ord('\n'):
+                self.state = 0
+                return "\n"
+        return ""
+
+def remove_comment(json):
+    fmt = JSFormat()
+    return "".join([fmt.push(c) for c in json])
 
 
 def parse_json_in_str(data):

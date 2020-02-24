@@ -1,54 +1,126 @@
-shadowsocks
+ShadowsocksR
 ===========
 
-[![PyPI version]][PyPI]
 [![Build Status]][Travis CI]
-[![Coverage Status]][Coverage]
 
 A fast tunnel proxy that helps you bypass firewalls.
 
 Server
 ------
 
+### Install with one click (一键安装)
+```
+sudo su
+
+wget --no-check-certificate https://raw.githubusercontent.com/ShadowsocksR-Live/shadowsocksr/manyuser/ssr-install.sh
+
+chmod +x ssr-install.sh
+
+./ssr-install.sh 2>&1 | tee ssr-install.log
+```
+To uninstall, using
+```
+./ssr-install.sh uninstall
+```
+
 ### Install
+
+Please make you as `root` account and change your working directory to the root first.
+
+    sudo su
+    cd / 
 
 Debian / Ubuntu:
 
-    apt-get install python-pip
-    pip install shadowsocks
+    apt-get install git
+    git clone https://github.com/ShadowsocksR-Live/shadowsocksr.git
 
 CentOS:
 
-    yum install python-setuptools && easy_install pip
-    pip install shadowsocks
+    yum install git
+    git clone https://github.com/ShadowsocksR-Live/shadowsocksr.git
 
 Windows:
 
-See [Install Server on Windows]
+    git clone https://github.com/ShadowsocksR-Live/shadowsocksr.git
 
-### Usage
+### Usage for single user on linux platform
 
-    ssserver -p 443 -k password -m aes-256-cfb
+If you clone it into "/shadowsocksr" folder, 
+please enter "/shadowsocksr" first, 
+
+    cd /shadowsocksr
+
+then run:
+
+    bash initcfg.sh
+
+Now, move to "/shadowsocksr/shadowsocks", 
+
+    cd /shadowsocksr/shadowsocks
+
+then run:
+
+    python server.py -p 443 -k password -m aes-128-cfb -O auth_aes128_md5 -o tls1.2_ticket_auth_compatible
+
+Check all the options via `-h`.
+
+You can also use a configuration file instead (recommend), move to "/shadowsocksr" and edit the file "user-config.json" with `vi` text editor, 
+
+    vi /shadowsocksr/user-config.json
+
+then move to "/shadowsocksr/shadowsocks" again, 
+
+    cd /shadowsocksr/shadowsocks
+
+and just run:
+
+    python server.py
+
+Now. Mission completed.
 
 To run in the background:
 
-    sudo ssserver -p 443 -k password -m aes-256-cfb --user nobody -d start
+    ./logrun.sh
 
 To stop:
 
-    sudo ssserver -d stop
+    ./stop.sh
 
-To check the log:
+To monitor the log:
 
-    sudo less /var/log/shadowsocks.log
+    ./tail.sh
 
-Check all the options via `-h`. You can also use a [Configuration] file
-instead.
+### Run as an automatical service
+
+If you hope the remote host to start the shadowsocksr service automatically when the host started, please:
+
+Edit the configuration file "user-config.json" with `vi` text editor, modify it with correct parameters.
+
+    vi /shadowsocksr/user-config.json
+
+Edit `/etc/rc.local` file with `vi` editor,
+
+    vi /etc/rc.local
+
+and add the following command to the end of the `/etc/rc.local` file.
+
+    /shadowsocksr/shadowsocks/logrun.sh
+    
+If the first line of file `/etc/rc.local` is not `#!/bin/sh -e`, please add it to the first line, 
+then make `/etc/rc.local` executable using the following command:
+
+    chmod +x /etc/rc.local
+    
+Please `reboot` your linux computer and all is done.
+
+About editing `user-config.json` and `/etc/rc.local` files with `vi` text editor utility, please see [How to Use the vi Editor](https://www.washington.edu/computing/unix/vi.html).
+
 
 Client
 ------
 
-* [Windows] / [OS X]
+* [Windows] / [macOS]
 * [Android] / [iOS]
 * [OpenWRT]
 
@@ -80,27 +152,17 @@ under the License.
 Bugs and Issues
 ----------------
 
-* [Troubleshooting]
 * [Issue Tracker]
-* [Mailing list]
 
 
 
-[Android]:           https://github.com/shadowsocks/shadowsocks-android
-[Build Status]:      https://img.shields.io/travis/shadowsocks/shadowsocks/master.svg?style=flat
-[Configuration]:     https://github.com/shadowsocks/shadowsocks/wiki/Configuration-via-Config-File
-[Coverage Status]:   https://jenkins.shadowvpn.org/result/shadowsocks
-[Coverage]:          https://jenkins.shadowvpn.org/job/Shadowsocks/ws/PYENV/py34/label/linux/htmlcov/index.html
+[Android]:           https://github.com/shadowsocksr/shadowsocksr-android
+[Build Status]:      https://travis-ci.org/shadowsocksr/shadowsocksr.svg?branch=manyuser
 [Debian sid]:        https://packages.debian.org/unstable/python/shadowsocks
 [iOS]:               https://github.com/shadowsocks/shadowsocks-iOS/wiki/Help
-[Issue Tracker]:     https://github.com/shadowsocks/shadowsocks/issues?state=open
-[Install Server on Windows]: https://github.com/shadowsocks/shadowsocks/wiki/Install-Shadowsocks-Server-on-Windows
-[Mailing list]:      https://groups.google.com/group/shadowsocks
+[Issue Tracker]:     https://github.com/shadowsocksr/shadowsocksr/issues?state=open
 [OpenWRT]:           https://github.com/shadowsocks/openwrt-shadowsocks
-[OS X]:              https://github.com/shadowsocks/shadowsocks-iOS/wiki/Shadowsocks-for-OSX-Help
-[PyPI]:              https://pypi.python.org/pypi/shadowsocks
-[PyPI version]:      https://img.shields.io/pypi/v/shadowsocks.svg?style=flat
-[Travis CI]:         https://travis-ci.org/shadowsocks/shadowsocks
-[Troubleshooting]:   https://github.com/shadowsocks/shadowsocks/wiki/Troubleshooting
-[Wiki]:              https://github.com/shadowsocks/shadowsocks/wiki
-[Windows]:           https://github.com/shadowsocks/shadowsocks-csharp
+[macOS]:             https://github.com/shadowsocksr/ShadowsocksX-NG
+[Travis CI]:         https://travis-ci.org/shadowsocksr/shadowsocksr
+[Windows]:           https://github.com/shadowsocksr/shadowsocksr-csharp
+[Wiki]:              https://github.com/breakwa11/shadowsocks-rss/wiki
